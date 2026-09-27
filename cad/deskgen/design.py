@@ -10,22 +10,21 @@ Parts are returned already placed in the assembled position (world coords).
 import cadquery as cq
 
 from . import params as P
-from .shell import ShellGeom, build_shell_body, build_seat_fill, build_ribs
+from .shell import ShellGeom, build_shell_body, build_seat_fill
 from .frames import FrameOutline, build_frame
 from .base import build_base
-from .desk import build_sleeve, build_head, build_top
-from .geom import box
-
-PAD_H = 27.0     # real-scale height of the bearing pad between frame apex and shell
+from .desk import build_sleeve, build_head, build_top, build_plug
+from .geom import box, rrect_prism
 
 COLORS_REAL = {
     "shell": (0.11, 0.11, 0.12), "frame_L": (0.11, 0.11, 0.12), "frame_R": (0.11, 0.11, 0.12),
+    "seat_beam": (0.11, 0.11, 0.12),
     "base": (0.62, 0.63, 0.65), "sleeve": (0.62, 0.63, 0.65), "head": (0.62, 0.63, 0.65),
-    "top": (0.95, 0.95, 0.96),
+    "top": (0.95, 0.95, 0.96), "plug": (0.95, 0.95, 0.96),
 }
 COLORS_PRINT = {
     "shell": "black", "frame_L": "black", "frame_R": "black",
-    "base": "white", "sleeve": "white", "head": "white", "top": "white",
+    "base": "white", "sleeve": "white", "head": "white", "top": "white", "plug": "white",
 }
 
 
@@ -35,15 +34,13 @@ class Design:
         self.k = 1.0 if mode == "real" else P.KIT_SCALE
         k = self.k
         self.kit = dict(P.KIT)
-        self.kit.update(tab_len=10.0, tab_t=2.6, tab_h=3.2,
-                        xbar_tab_len=5.0, xbar_tab_h=3.6, xbar_tab_z0=0.0, xbar_tab_depth=2.6)
         self.ribs = (mode == "print") if ribs is None else ribs
         self.g = ShellGeom(k, mode)
         s = self.g.s_at_x(P.FRAME_APEX_X * k)
         yc = (P.FRAME_Y_OUT - P.FRAME_T / 2) * k
         under = self.g.surface_point(s, yc, side=-1)[2]
         self.shell_under_at_apex = under
-        self.apex_top_z = under - PAD_H * k
+        self.apex_top_z = under - P.PAD_H * k
         self.outline = FrameOutline(k, self.apex_top_z)
         self._cache = {}
 
@@ -86,6 +83,10 @@ class Design:
         add, sub = self.shell_components()
         body = build_shell_body_mesh(self.g)
         mans = [to_manifold(body)] + [to_manifold(to_trimesh(s, tol, ang)) for s in add[1:]]
+        if self.mode == "real":
+            from .shell import seat_rib_meshes
+            for rm, _ in seat_rib_meshes(self.g):
+                mans.append(to_manifold(rm))
         if self.ribs:
             from .shell import rib_paths, rib_mesh
             if self.mode == "print":
@@ -96,20 +97,39 @@ class Design:
             for pts, nrm in rib_paths(g, g.sc[9] + 2 * pitch, g.sc[14] - 3 * pitch, pitch, margin):
                 mans.append(to_manifold(rib_mesh(pts, nrm, r, sink=0.05 * r)))
         res = mf.Manifold.batch_boolean(mans, mf.OpType.Add)
-        if sub:
-            res = res - mf.Manifold.batch_boolean([to_manifold(to_trimesh(s, tol, ang)) for s in sub],
-                                                  mf.OpType.Add)
+        cut = [to_manifold(to_trimesh(s, tol, ang)) for s in sub]
+        if self.mode == "real":
+            cut.append(to_manifold(to_trimesh(self.seat_beam(clearance=1.0), tol, ang)))
+        if cut:
+            res = res - mf.Manifold.batch_boolean(cut, mf.OpType.Add)
         return from_manifold(res)
 
     def shell(self):
-        """Exact B-rep shell (slow: ~5 min, used only for STEP export)."""
+        """Exact B-rep shell for the STEP export (slow, several minutes). Leaves out the grip ribs
+        and the under-seat ribs, which only exist in the meshes."""
         add, sub = self.shell_components()
         s = build_shell_body(self.g).fuse(*add[1:])
+        if self.mode == "real":
+            sub = sub + [self.seat_beam(clearance=1.0)]
         if sub:
             s = s.cut(*sub)
         return s.clean()
 
-    def pad_solid(self, r_f=30.0):
+    def seat_beam(self, clearance=0.0):
+        """Hidden aluminium cross beam under the seat, bolted to both frame apexes (real product).
+        Carries the seat across its width and ties the two frames together."""
+        k, g = self.k, self.g
+        xa = self.outline.apex_centre[0]
+        s = g.s_at_x(xa)
+        ztop = g.surface_point(s, 0.0, side=-1)[2] - 0.5 * k
+        bx, bz = P.SEAT_BEAM
+        c = clearance * k
+        y = P.FRAME_Y_IN * k + c
+        beam = box(xa - bx * k / 2 - c, xa + bx * k / 2 + c, -y, y, ztop - bz * k - c, ztop + c)
+        long_edges = [e for e in beam.Edges() if abs(e.Center().y) < 1e-6]
+        return beam.fillet(6 * k + c, long_edges)
+
+    def pad_solid(self, r_f=P.PAD_BLEND_R):
         """Bearing pad: a moulded fillet flowing from the frame's round apex up into the seat.
 
         Side profile = region above the apex arc and below the seat, bounded front and
@@ -177,6 +197,9 @@ class Design:
             return cq.Vector(float(p[0]), y0, float(p[1]))
 
         ow = segs_to_wire(self.outline.segs, to3d)
+        if self.mode == "real":
+            # 0.3 mm assembly clearance so faceted meshes of pad and apex never overlap
+            ow = ow.offset2D(0.3, "arc")[0]
         f = cq.Face.makeFromWires(ow, [])
         return cq.Solid.extrudeLinear(f, cq.Vector(0, -(P.FRAME_T * k + 2), 0))
 
@@ -196,6 +219,9 @@ class Design:
     def top(self, hi=P.DEFAULT_HEIGHT_INDEX, gi=P.DEFAULT_GAP_INDEX):
         return build_top(self.k, self.mode, hi, gi, self.kit)
 
+    def plug(self, hi=P.DEFAULT_HEIGHT_INDEX, gi=P.DEFAULT_GAP_INDEX):
+        return build_plug(self.k, self.mode, hi, gi, self.kit)
+
     def parts(self, hi=P.DEFAULT_HEIGHT_INDEX, gi=P.DEFAULT_GAP_INDEX):
         return {
             "shell": None,          # use shell_mesh() / shell()
@@ -205,4 +231,5 @@ class Design:
             "sleeve": self.sleeve(),
             "head": self.head(hi),
             "top": self.top(hi, gi),
+            "plug": self.plug(hi, gi),
         }

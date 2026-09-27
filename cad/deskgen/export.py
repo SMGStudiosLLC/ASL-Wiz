@@ -33,8 +33,12 @@ def export_usdz(named, path, metallic=None):
     UsdGeom.SetStageMetersPerUnit(stage, 1.0)
     root = UsdGeom.Xform.Define(stage, "/DELTA")
     stage.SetDefaultPrim(root.GetPrim())
+    Usd.ModelAPI(root.GetPrim()).SetKind("component")
+    allv = np.concatenate([np.asarray(m.vertices) for _, m, _ in named])
+    centre = (allv.min(0) + allv.max(0)) / 2
+    centre[2] = 0.0                                         # keep the floor at zero
     for name, m, rgb in named:
-        v = np.asarray(m.vertices) * 0.001
+        v = (np.asarray(m.vertices) - centre) * 0.001
         v = np.stack([v[:, 0], v[:, 2], -v[:, 1]], 1)        # Z-up mm -> Y-up m
         mesh = UsdGeom.Mesh.Define(stage, f"/DELTA/{name}")
         mesh.CreatePointsAttr([Gf.Vec3f(*p) for p in v])

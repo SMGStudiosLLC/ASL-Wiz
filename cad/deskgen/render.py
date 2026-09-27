@@ -26,20 +26,67 @@ def _polydata(m):
     return nrm.GetOutput()
 
 
+def baked_shadow(meshes, lo, hi, light=(0.45, 0.6, -1.0), res=1400, pad=0.9, strength=0.42):
+    """Soft floor shadow + contact occlusion as an RGB texture, returned with its XY extent."""
+    from PIL import ImageDraw, ImageFilter
+    import fast_simplification
+    span = (hi[:2] - lo[:2])
+    c = (hi[:2] + lo[:2]) / 2
+    half = max(span) * (0.5 + pad)
+    x0, y0 = c - half
+    size = 2 * half
+    def canvas():
+        return Image.new("L", (res, res), 0)
+    def to_px(xy):
+        return np.stack([(xy[:, 0] - x0) / size * res, (1 - (xy[:, 1] - y0) / size) * res], 1)
+    L = np.array(light, float)
+    L /= np.linalg.norm(L)
+    z0 = lo[2]
+    layers = {"dir": canvas(), "c1": canvas(), "c2": canvas(), "c3": canvas()}
+    draws = {k: ImageDraw.Draw(v) for k, v in layers.items()}
+    for m in meshes:
+        v, f = np.asarray(m.vertices), np.asarray(m.faces)
+        if len(f) > 30000:
+            v, f = fast_simplification.simplify(v.astype(np.float32), f.astype(np.int32), target_count=30000)
+        h = v[:, 2] - z0
+        proj = v[:, :2] - (h / L[2])[:, None] * L[:2]
+        pd = to_px(proj)
+        pv = to_px(v[:, :2])
+        tri_h = h[f].min(1)
+        pdl, pvl = pd.tolist(), pv.tolist()
+        for t, hh in zip(f.tolist(), tri_h.tolist()):
+            draws["dir"].polygon([tuple(pdl[i]) for i in t], fill=255)
+            q = [tuple(pvl[i]) for i in t]
+            if hh < 40:
+                draws["c1"].polygon(q, fill=255)
+            if hh < 160:
+                draws["c2"].polygon(q, fill=255)
+            if hh < 450:
+                draws["c3"].polygon(q, fill=255)
+    px_per_mm = float(res / size)
+    def blur(im, mm):
+        return np.asarray(im.filter(ImageFilter.GaussianBlur(float(max(1.0, mm * px_per_mm)))), float) / 255
+    sh = (0.55 * blur(layers["dir"], 28) + 0.55 * blur(layers["c1"], 6)
+          + 0.35 * blur(layers["c2"], 22) + 0.22 * blur(layers["c3"], 60))
+    sh = np.clip(sh, 0, 1) * strength
+    return sh, (x0, y0, size)
+
+
 MATERIALS = {
     # colour, diffuse, specular, specular power
-    "black_pp": ((0.085, 0.085, 0.095), 0.9, 0.35, 28),
+    "black_pp": ((0.105, 0.105, 0.115), 0.85, 0.42, 22),
     "black_pla": ((0.07, 0.07, 0.08), 0.9, 0.45, 40),
     "white": ((0.93, 0.93, 0.94), 0.85, 0.25, 30),
     "white_pla": ((0.95, 0.95, 0.95), 0.85, 0.3, 40),
     "alu": ((0.66, 0.67, 0.69), 0.75, 0.6, 60),
     "ghost": ((0.55, 0.62, 0.72), 0.9, 0.1, 10),
+    "person": ((0.62, 0.74, 0.90), 0.85, 0.15, 12),
 }
 
 
 def render(items, out, view=(-1.0, -1.25, 0.72), target=None, up=(0, 0, 1), size=(1800, 1200),
            ortho=False, zoom=1.0, floor=True, bg=((0.97, 0.97, 0.975), (0.86, 0.86, 0.875)),
-           ssao=True, shadows=True, fov=24, supersample=2, extra=None, bg_flat=None):
+           ssao=True, shadows=False, fov=24, supersample=2, extra=None, bg_flat=None):
     """items: list of (trimesh, material_name or (rgb, diff, spec, power), opacity)."""
     W, H = size[0] * supersample, size[1] * supersample
     ren = vtk.vtkRenderer()
@@ -80,22 +127,43 @@ def render(items, out, view=(-1.0, -1.25, 0.72), target=None, up=(0, 0, 1), size
 
     if floor:
         z0 = lo[2] - 0.0005 * diag
+        floor_rgb = np.array(bg_flat if bg_flat is not None else bg[1])
+        sh, (fx0, fy0, fsize) = baked_shadow([it[0] for it in items], lo, hi)
+        tex = (floor_rgb[None, None, :] * (1 - sh[:, :, None]) * 255).astype(np.uint8)
+        img = vtk.vtkImageData()
+        img.SetDimensions(tex.shape[1], tex.shape[0], 1)
+        arr = numpy_to_vtk(np.ascontiguousarray(tex[::-1].reshape(-1, 3)), deep=True,
+                           array_type=vtk.VTK_UNSIGNED_CHAR)
+        arr.SetNumberOfComponents(3)
+        img.GetPointData().SetScalars(arr)
+        vt = vtk.vtkTexture()
+        vt.SetInputData(img)
+        vt.InterpolateOn()
         pl = vtk.vtkPlaneSource()
-        R = diag * 40
-        pl.SetOrigin(ctr[0] - R, ctr[1] - R, z0)
-        pl.SetPoint1(ctr[0] + R, ctr[1] - R, z0)
-        pl.SetPoint2(ctr[0] - R, ctr[1] + R, z0)
-        pl.SetResolution(8, 8)
+        pl.SetOrigin(fx0, fy0, z0)
+        pl.SetPoint1(fx0 + fsize, fy0, z0)
+        pl.SetPoint2(fx0, fy0 + fsize, z0)
         fm = vtk.vtkPolyDataMapper()
         fm.SetInputConnection(pl.GetOutputPort())
         fa = vtk.vtkActor()
         fa.SetMapper(fm)
-        fp = fa.GetProperty()
-        fp.SetColor(0.955, 0.955, 0.96)
-        fp.SetDiffuse(0.9)
-        fp.SetSpecular(0.0)
-        fp.SetAmbient(0.2)
+        fa.SetTexture(vt)
+        fa.GetProperty().LightingOff()
         ren.AddActor(fa)
+        # seamless: infinite floor beyond the texture in the flat background colour
+        big = vtk.vtkPlaneSource()
+        R = diag * 60
+        big.SetOrigin(ctr[0] - R, ctr[1] - R, z0 - 0.3)
+        big.SetPoint1(ctr[0] + R, ctr[1] - R, z0 - 0.3)
+        big.SetPoint2(ctr[0] - R, ctr[1] + R, z0 - 0.3)
+        bm = vtk.vtkPolyDataMapper()
+        bm.SetInputConnection(big.GetOutputPort())
+        ba = vtk.vtkActor()
+        ba.SetMapper(bm)
+        ba.GetProperty().LightingOff()
+        ba.GetProperty().SetColor(*floor_rgb)
+        ren.AddActor(ba)
+        shadows = False
 
     if extra:
         for a in extra(ren):
@@ -172,4 +240,7 @@ def render(items, out, view=(-1.0, -1.25, 0.72), target=None, up=(0, 0, 1), size
     if supersample > 1:
         im = im.resize(size, Image.LANCZOS)
     im.save(out)
-    return out
+    info = dict(ctr=ctr, scale=(diag * 0.36 / zoom) if ortho else None, size=size,
+                right=np.cross(-v, np.array(up, float)) / np.linalg.norm(np.cross(-v, np.array(up, float))),
+                up=np.array(up, float))
+    return info

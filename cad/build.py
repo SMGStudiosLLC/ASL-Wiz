@@ -21,21 +21,25 @@ sys.path.insert(0, HERE)
 from deskgen import params as P                                  # noqa: E402
 from deskgen.design import Design, COLORS_REAL                    # noqa: E402
 from deskgen.kit import (build_kit_meshes, to_print_pose, layout,  # noqa: E402
-                         write_3mf, NICE_NAMES)
+                         write_3mf, NICE_NAMES, shell_support)
 from deskgen.mesh import to_trimesh                               # noqa: E402
 from deskgen.export import export_glb, export_usdz, export_step   # noqa: E402
 
 BLACK, WHITE = "#1D1D1F", "#F5F5F7"
 KIT_COLOUR = {"shell": BLACK, "frame_L": BLACK, "frame_R": BLACK,
-              "base": WHITE, "sleeve": WHITE, "head": WHITE, "top": WHITE}
-ORDER = ["shell", "frame_L", "frame_R", "base", "sleeve", "head", "top"]
+              "base": WHITE, "sleeve": WHITE, "head": WHITE, "top": WHITE, "plug": WHITE}
+ORDER = ["shell", "frame_L", "frame_R", "base", "sleeve", "head", "top", "plug"]
+REAL_ORDER = ["shell", "seat_beam", "frame_L", "frame_R", "base", "sleeve", "head", "top", "plug"]
 
 
 def build_print():
     out = os.path.join(ROOT, "print")
     os.makedirs(os.path.join(out, "stl"), exist_ok=True)
+    import trimesh
     d, meshes = build_kit_meshes()
-    posed = {n: to_print_pose(n, m) for n, m in meshes.items()}
+    # the shell prints with its breakaway support fin (snap it off after printing)
+    shell_print = trimesh.util.concatenate([meshes["shell"]] + shell_support(d))
+    posed = {n: to_print_pose(n, (shell_print if n == "shell" else m)) for n, m in meshes.items()}
     for i, n in enumerate(ORDER, 1):
         col = "BLACK" if KIT_COLOUR[n] == BLACK else "WHITE"
         posed[n].export(os.path.join(out, "stl", f"{i:02d}_{NICE_NAMES[n]}_{col}.stl"))
@@ -54,20 +58,20 @@ def build_real(step=False):
     out = os.path.join(ROOT, "models")
     os.makedirs(os.path.join(out, "stl"), exist_ok=True)
     d = Design("real", ribs=True)
-    solids = {"frame_L": d.frame(+1), "frame_R": d.frame(-1), "base": d.base(),
-              "sleeve": d.sleeve(), "head": d.head(), "top": d.top()}
+    solids = {"seat_beam": d.seat_beam(), "frame_L": d.frame(+1), "frame_R": d.frame(-1), "base": d.base(),
+              "sleeve": d.sleeve(), "head": d.head(), "top": d.top(), "plug": d.plug()}
     meshes = {"shell": d.shell_mesh()}
     for n, s in solids.items():
         meshes[n] = to_trimesh(s, 0.15, 0.12)
-    for n in ORDER:
+    for n in REAL_ORDER:
         meshes[n].export(os.path.join(out, "stl", f"{NICE_NAMES[n]}_full-size_mm.stl"))
-    named = [(NICE_NAMES[n], meshes[n], COLORS_REAL[n]) for n in ORDER]
+    named = [(NICE_NAMES[n], meshes[n], COLORS_REAL[n]) for n in REAL_ORDER]
     export_glb(named, os.path.join(out, "DELTA_chair-desk_full-size.glb"))
     metal = {NICE_NAMES[n]: 0.55 for n in ("base", "sleeve", "head")}
     export_usdz(named, os.path.join(out, "DELTA_chair-desk_AR.usdz"), metallic=metal)
     if step:
         solids["shell"] = Design("real", ribs=False).shell()
-        export_step([(NICE_NAMES[n], solids[n], COLORS_REAL[n]) for n in ORDER],
+        export_step([(NICE_NAMES[n], solids[n], COLORS_REAL[n]) for n in REAL_ORDER],
                     os.path.join(out, "DELTA_chair-desk_full-size.step"))
     return d, meshes
 

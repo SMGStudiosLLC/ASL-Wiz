@@ -33,7 +33,8 @@ def loft(wires):
 class ShellGeom:
     """Centreline, section functions and point queries for the shell."""
 
-    PRINT_T = [1.5, 1.7, 1.7, 1.7, 1.7, 1.7, 1.7, 1.65, 1.45, 1.3, 1.3, 1.3, 1.4, 1.45, 1.45, 1.45, 1.4]
+    REAL_T = [4.5, 5, 5, 5, 5.5, 7.0, 9.0, 9.5, 9.0, 6.5, 6.0, 6.0, 5.5, 5, 5, 5, 4.5]
+    PRINT_T = [1.5, 1.7, 1.7, 1.7, 1.7, 1.7, 1.7, 1.65, 1.45, 1.25, 1.25, 1.25, 1.35, 1.45, 1.45, 1.45, 1.4]
 
     def __init__(self, k=1.0, mode="real"):
         self.k, self.mode = k, mode
@@ -46,10 +47,16 @@ class ShellGeom:
         self.sc = np.interp(u, self.uu, self.S)
         sc = list(self.sc)
         self.fw = _pchip(sc, np.array(P.SHELL_HALF_W) * k)
-        self.fd = _pchip(sc, np.array(P.SHELL_DISH) * k)
+        dish = np.array(P.SHELL_DISH, float)
+        if mode == "print":
+            for i, f in getattr(P, "SHELL_DISH_PRINT_FACTOR", {}).items():
+                dish[i] *= f
+        self.fd = _pchip(sc, dish * k)
         self.fr = _pchip(sc, np.array(P.SHELL_ROLL) * k)
         if mode == "real":
-            self.ft = lambda s: P.SHELL_T * k
+            # thicker, gas-assist-cored junction carries the backrest moment into the seat;
+            # keeps the outside smooth (no visible ribs behind the back)
+            self.ft = _pchip(sc, np.array(self.REAL_T) * k)
         else:
             self.ft = _pchip(sc, self.PRINT_T)
         # how far the edge roll turns: to vertical for the product, 45 deg for the print model
@@ -328,3 +335,120 @@ def rib_mesh(pts, nrm, r, nseg=12, ncap=4, sink=0.0):
     if m.volume < 0:
         m.invert()
     return m
+
+
+# under-seat ribs (full-size product only): stiffen the seat front and carry the
+# backrest's lean moment through the junction.  Hidden under the seat.
+SEAT_RIB_Y = (50.0, 105.0, 155.0)   # lateral positions (mirrored)
+SEAT_RIB_T = 4.5
+SEAT_RIB_DEPTH = 34.0
+
+
+def seat_rib_depth(x, z, k=1.0):
+    """Depth profile along a rib: shallow at the front edge, full under the seat,
+    fading out before the junction (the thickened junction carries the back load)."""
+    D = SEAT_RIB_DEPTH * k
+    if x > 330 * k:
+        return D * max(0.0, (405 * k - x) / (75 * k)) ** 0.8
+    if x < 95 * k:
+        # die out before the seat curls up into the back, so nothing shows from behind
+        return D * max(0.0, (x - 38 * k) / (57 * k)) ** 0.7
+    return D
+
+
+def seat_rib_meshes(g: ShellGeom):
+    import trimesh
+    k = g.k
+    out = []
+    s0 = g.s_at_x(404 * k, 1, 6)
+    s1 = g.s_at_x(38 * k, 3, 7)
+    ss = np.linspace(s0, s1, 90)
+    for yr in SEAT_RIB_Y:
+        for side in (+1, -1):
+            y = side * yr * k
+            top, bot = [], []
+            for s in ss:
+                p = g.surface_point(s, abs(y), side=-1)
+                Pp, T, N = g.frame_at(s)
+                dep = max(0.6 * k, seat_rib_depth(p[0], p[2], k))
+                q_in = np.array([p[0] + N[0] * 1.0 * k, y, p[2] + N[1] * 1.0 * k])   # overlap into the shell
+                q_out = np.array([p[0] - N[0] * dep, y, p[2] - N[1] * dep])
+                top.append(q_in)
+                bot.append(q_out)
+            top, bot = np.array(top), np.array(bot)
+            h = SEAT_RIB_T * k / 2
+            verts = np.concatenate([top + [0, -h, 0], bot + [0, -h, 0], top + [0, h, 0], bot + [0, h, 0]])
+            n = len(ss)
+            idx = lambda a, i: a * n + i
+            faces = []
+            for i in range(n - 1):
+                for a, b, flip in ((0, 1, False), (2, 3, True), (0, 2, True), (1, 3, False)):
+                    f1 = [idx(a, i), idx(b, i), idx(b, i + 1)]
+                    f2 = [idx(a, i), idx(b, i + 1), idx(a, i + 1)]
+                    if flip:
+                        f1, f2 = f1[::-1], f2[::-1]
+                    faces += [f1, f2]
+            for i, flip in ((0, True), (n - 1, False)):
+                q = [idx(0, i), idx(1, i), idx(3, i), idx(2, i)]
+                f1, f2 = [q[0], q[1], q[2]], [q[0], q[2], q[3]]
+                if flip:
+                    f1, f2 = f1[::-1], f2[::-1]
+                faces += [f1, f2]
+            m = trimesh.Trimesh(verts, np.array(faces), process=True)
+            if m.volume < 0:
+                m.invert()
+            out.append((m, abs(yr * k)))
+    return out
+
+
+
+def support_fin_mesh(g: ShellGeom, gap=0.2, width=0.8, min_h=0.7):
+    """Breakaway support for the print: a thin wall standing on the bed under the stretch of
+    the shell's lower side edge that curves up off the bed (the back's waist).  Assembled
+    coordinates; the bed is the shell's -Y extreme."""
+    import trimesh
+    ss = np.linspace(g.sc[6], g.sc[14], 400)
+    ext = []
+    for s in ss:
+        uc, vc, tc, _ = g.centre_curve(s, nA=4, nB=24)
+        t = g.thickness(s)
+        u_out = uc[-1] + t / 2
+        Pp, T, N = g.frame_at(s)
+        xz = Pp + N * vc[-1]
+        ext.append((s, u_out, xz, N))
+    y_bed = -max(e[1] for e in [(0, g.fw(x) + g.thickness(x) / 2) for x in np.linspace(0, g.L, 800)])
+    runs, cur = [], []
+    for s, u_out, xz, N in ext:
+        h = (-u_out - gap) - y_bed
+        if h >= min_h:
+            cur.append((xz, N, h))
+        elif cur:
+            runs.append(cur)
+            cur = []
+    if cur:
+        runs.append(cur)
+    meshes = []
+    for run in runs:
+        if len(run) < 3:
+            continue
+        verts, faces = [], []
+        n = len(run)
+        for xz, N, h in run:
+            for off in (-width / 2, width / 2):
+                p = xz + N * off
+                verts.append([p[0], y_bed, p[1]])
+                verts.append([p[0], y_bed + h, p[1]])
+        idx = lambda i, side, top: 4 * i + 2 * side + top
+        for i in range(n - 1):
+            for a, b in (((0, 0), (0, 1)), ((1, 1), (1, 0)), ((0, 1), (1, 1)), ((1, 0), (0, 0))):
+                q = [idx(i, *a), idx(i, *b), idx(i + 1, *b), idx(i + 1, *a)]
+                faces += [[q[0], q[1], q[2]], [q[0], q[2], q[3]]]
+        for i, flip in ((0, False), (n - 1, True)):
+            q = [idx(i, 0, 0), idx(i, 1, 0), idx(i, 1, 1), idx(i, 0, 1)]
+            f1, f2 = [q[0], q[1], q[2]], [q[0], q[2], q[3]]
+            faces += ([f1[::-1], f2[::-1]] if flip else [f1, f2])
+        m = trimesh.Trimesh(np.array(verts), np.array(faces), process=True)
+        if m.volume < 0:
+            m.invert()
+        meshes.append(m)
+    return meshes

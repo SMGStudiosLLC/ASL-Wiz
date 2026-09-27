@@ -61,6 +61,18 @@ def build_frame(outline: FrameOutline, side, mode, kit=None):
     r = P.FRAME_EDGE_R * k
     solid = solid.fillet(r, edges)
 
+    # glide feet on the outside: flat-bottomed pods that widen the footprint for sitting sideways
+    for px0, px1 in P.POD_X:
+        pod = box(px0 * k, px1 * k, y_out - 6 * k, y_out + P.POD_OUT * k, 0.0, P.POD_H * k)
+        try:
+            vert = [e for e in pod.Edges() if abs(e.Center().z - P.POD_H * k / 2) < 1e-6]
+            pod = pod.fillet(min(12 * k, P.POD_OUT * k * 0.6), vert)
+            top = [e for e in pod.Edges() if e.Center().z > P.POD_H * k * 0.6]
+            pod = pod.fillet(8 * k, top)
+        except Exception:
+            pass
+        solid = solid.fuse(pod).clean()
+
     if mode == "print":
         kp = kit
         cx = outline.apex_centre[0]
@@ -70,13 +82,19 @@ def build_frame(outline: FrameOutline, side, mode, kit=None):
         tab = box(cx - kp["tab_len"] / 2, cx + kp["tab_len"] / 2,
                   y_in, y_in + kp["tab_t"],
                   outline.apex_top_z - 1.2, outline.apex_top_z + kp["tab_h"])
+        try:
+            top = [e for e in tab.Edges() if abs(e.Center().z - (outline.apex_top_z + kp["tab_h"])) < 1e-6
+                   and abs(e.Center().y - y_in) > 1e-6]
+            tab = tab.chamfer(kp["chamfer"], None, top)
+        except Exception:
+            pass
         solid = solid.fuse(tab).clean()
         # socket on the inner face for the base cross bar
         xc = (P.CROSSBAR_X[0] + P.CROSSBAR_X[1]) / 2 * k
         c = kp["snug"]
         pocket = box(xc - kp["xbar_tab_len"] / 2 - c, xc + kp["xbar_tab_len"] / 2 + c,
                      y_in - 0.01, y_in + kp["xbar_tab_depth"] + 0.25,
-                     -1.0, kp["xbar_tab_z0"] + kp["xbar_tab_h"] + c)      # open at the bottom: frame drops onto the tab
+                     -1.0, kp["xbar_tab_h"] + c)      # open at the bottom: the frame drops onto the tab
         solid = solid.cut(pocket).clean()
 
     if side < 0:
