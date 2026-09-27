@@ -45,15 +45,18 @@ class Design:
         self._cache = {}
 
     # --------------------------------------------------------------- shell
-    def shell_components(self):
-        """Body, pads, sockets and ribs as separate B-rep solids (combined later)."""
-        if "shell_comp" in self._cache:
-            return self._cache["shell_comp"]
+    def shell_components(self, skin=+1):
+        """Body, pads, sockets and ribs as separate B-rep solids (combined later).
+        skin=+1: pads reach up through the shell wall (for mesh unions);
+        skin=-1: pads stop at the shell's underside (touching solids for the STEP)."""
+        key = ("shell_comp", skin)
+        if key in self._cache:
+            return self._cache[key]
         k, g = self.k, self.g
         body = None                      # B-rep body built lazily in shell() (slow loft)
         xa = self.outline.apex_centre[0]
         s_front, s_back = g.s_at_x(xa + 75 * k), g.s_at_x(xa - 75 * k)
-        fill = build_seat_fill(g, s_front, s_back, drop=120 * k)
+        fill = build_seat_fill(g, s_front, s_back, drop=120 * k, skin=skin, n=9 if skin > 0 else 25)
         yin, yout = P.FRAME_Y_IN * k, P.FRAME_Y_OUT * k
         prism = self.frame_prism()
         add, sub = [body], []
@@ -71,7 +74,7 @@ class Design:
                            yin - c, yin + kp["tab_t"] + c,
                            self.apex_top_z - 3, self.apex_top_z + kp["tab_h"] + 0.3)
                 sub.append(sock if side > 0 else sock.mirror("XZ"))
-        self._cache["shell_comp"] = (add, sub)
+        self._cache[key] = (add, sub)
         return add, sub
 
     def shell_mesh(self, tol=None, ang=0.15):
@@ -105,15 +108,39 @@ class Design:
         return from_manifold(res)
 
     def shell(self):
-        """Exact B-rep shell for the STEP export (slow, several minutes). Leaves out the grip ribs
-        and the under-seat ribs, which only exist in the meshes."""
-        add, sub = self.shell_components()
-        s = build_shell_body(self.g).fuse(*add[1:])
+        """Exact B-rep shell for the STEP export: the lofted shell plus the two bearing pads as
+        touching solids in one compound (OpenCASCADE booleans against the loft are unreliable).
+        Leaves out the grip ribs and the under-seat ribs, which only exist in the meshes."""
+        add, sub = self.shell_components(skin=-1)
         if self.mode == "real":
             sub = sub + [self.seat_beam(clearance=1.0)]
-        if sub:
-            s = s.cut(*sub)
-        return s.clean()
+        sub = sub + self._skirt_keepout()
+        pads = [p.cut(*sub).clean() for p in add[1:]]
+        return cq.Compound.makeCompound([build_shell_body(self.g)] + pads)
+
+    def _skirt_keepout(self, gap=0.6):
+        """Solids covering the curled side edges of the seat (inside face outward, down to just
+        below the edge's lowest point), used to keep the STEP's pads out of the shell wall."""
+        import numpy as np
+        g, k = self.g, self.k
+        xa = self.outline.apex_centre[0]
+        xs = np.linspace(xa - 140 * k, xa + 140 * k, 29)
+        inner, lows = [], []
+        for x in xs:
+            st = g.s_at_x(x)
+            ring = g.ring(st)
+            side = ring[ring[:, 0] > g.fw(st) - g.fr(st)]           # the curled part of the edge
+            pts = np.array([[p.x, p.y, p.z] for p in g.to3d(st, side)])
+            lows.append(pts[:, 2].min() - gap * k)
+            inner.append(g.fw(st) - g.thickness(st) / 2 - 2.0 * k)    # inside face of the edge's vertical part
+        y0 = float(min(inner))
+        out = []
+        for sgn in (+1, -1):
+            prof = [(float(x), float(z)) for x, z in zip(xs, lows)] + [(float(xs[-1]), 2000.0 * k), (float(xs[0]), 2000.0 * k)]
+            wp = cq.Workplane("XZ", origin=(0, 0, 0)).polyline(prof).close()
+            solid = wp.extrude(-(400 * k)).val().translate(cq.Vector(0, y0, 0))   # XZ extrudes toward -Y
+            out.append(solid if sgn > 0 else solid.mirror("XZ"))
+        return out
 
     def seat_beam(self, clearance=0.0):
         """Hidden aluminium cross beam under the seat, bolted to both frame apexes (real product).

@@ -160,20 +160,37 @@ class ShellGeom:
 
 
 def build_shell_body(g: ShellGeom):
+    rings = [np.asarray([[v.x, v.y, v.z] for v in g.to3d(s, g.ring(s))]) for s in g.stations()]
+    # One shared (averaged chord-length) parametrisation for every ring: the rings then have
+    # identical knot vectors, so the loft does not merge them into one enormous surface.
+    ts = []
+    for r in rings:
+        d = np.linalg.norm(np.diff(np.vstack([r, r[:1]]), axis=0), axis=1)
+        ts.append(np.concatenate([[0.0], np.cumsum(d)]) / d.sum())
+    params = list(np.mean(ts, axis=0))
     wires = []
-    for s in g.stations():
-        pts = g.to3d(s, g.ring(s))
-        wires.append(cq.Wire.assembleEdges([cq.Edge.makeSpline(pts, periodic=True)]))
-    return loft(wires)
+    for r in rings:
+        pts = [cq.Vector(*p) for p in r]
+        wires.append(cq.Wire.assembleEdges([cq.Edge.makeSpline(pts, periodic=True, parameters=params)]))
+    body = loft(wires)
+    # split the single closed side face into pieces: a closed periodic face does not survive
+    # a STEP round trip, a divided one does
+    from OCP.ShapeUpgrade import ShapeUpgrade_ShapeDivideClosed
+    div = ShapeUpgrade_ShapeDivideClosed(body.wrapped)
+    div.SetNbSplitPoints(3)
+    div.Perform()
+    return cq.Shape.cast(div.Result())
 
 
-def build_seat_fill(g: ShellGeom, s0, s1, drop):
-    """Solid filling everything below the shell's top skin between stations s0..s1."""
+def build_seat_fill(g: ShellGeom, s0, s1, drop, skin=+1, n=9):
+    """Solid filling everything below the shell's top skin (skin=+1) or below its underside
+    (skin=-1, so it only touches the shell) between stations s0..s1."""
     wires = []
-    for s in np.linspace(s0, s1, 9):
-        uc, vc, tc, _ = g.centre_curve(s)
+    for s in np.linspace(s0, s1, n):
+        uc, vc, tc, _ = g.centre_curve(s, *((12, 9) if skin > 0 else (40, 30)))
         t = g.thickness(s)
-        top = np.stack([uc - np.sin(tc) * t / 2, vc + np.cos(tc) * t / 2], 1)
+        off = t / 2 if skin > 0 else t / 2 + 0.6 * g.k      # small gap so the flat facets never cut into the wall
+        top = np.stack([uc - skin * np.sin(tc) * off, vc + skin * np.cos(tc) * off], 1)
         # outer end of the rolled edge, then straight down and across the bottom
         u_ext = g.fw(s) + t * 1.5            # beyond the skirt's outermost point
         right = np.concatenate([top, [[u_ext, top[-1, 1] - t], [u_ext, -drop]]])
