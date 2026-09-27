@@ -8,7 +8,7 @@ Build every output file for the DELTA chair-desk.
 Outputs
     print/            1:6 kit: one STL per part (already in print orientation),
                       a 3MF plate per colour, and a coloured assembled preview
-    models/           full size: GLB (any 3D viewer), USDZ (iPhone AR), STL per part, STEP
+    models/           full size: GLB (any 3D viewer), USDZ (iPhone AR), DAE (SketchUp), STL per part, STEP
 """
 import os
 import sys
@@ -23,7 +23,7 @@ from deskgen.design import Design, COLORS_REAL                    # noqa: E402
 from deskgen.kit import (build_kit_meshes, to_print_pose, layout,  # noqa: E402
                          write_3mf, NICE_NAMES, shell_support)
 from deskgen.mesh import to_trimesh                               # noqa: E402
-from deskgen.export import export_glb, export_usdz, export_step   # noqa: E402
+from deskgen.export import export_glb, export_usdz, export_dae, export_step   # noqa: E402
 
 BLACK, WHITE = "#1D1D1F", "#F5F5F7"
 KIT_COLOUR = {"shell": BLACK, "frame_L": BLACK, "frame_R": BLACK,
@@ -69,6 +69,10 @@ def build_real(step=False):
     export_glb(named, os.path.join(out, "DELTA_chair-desk_full-size.glb"))
     metal = {NICE_NAMES[n]: 0.55 for n in ("base", "sleeve", "head")}
     export_usdz(named, os.path.join(out, "DELTA_chair-desk_AR.usdz"), metallic=metal)
+    budget = {NICE_NAMES["shell"]: 60000, NICE_NAMES["base"]: 12000, NICE_NAMES["frame_L"]: 8000,
+              NICE_NAMES["frame_R"]: 8000, NICE_NAMES["sleeve"]: 4000, NICE_NAMES["head"]: 5000,
+              NICE_NAMES["top"]: 8000}
+    export_dae(named, os.path.join(out, "DELTA_chair-desk_for-SketchUp.dae"), max_faces=budget)
     if step:
         solids["shell"] = Design("real", ribs=False).shell()
         export_step([(NICE_NAMES[n], solids[n], COLORS_REAL[n]) for n in REAL_ORDER],
